@@ -1,0 +1,218 @@
+name: Render Sinai Video (1080p)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  render-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg, Hebrew Fonts, Chrome Libs & Whisper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg culmus fonts-noto-core fonts-noto-extra wget
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y -qq ./google-chrome-stable_current_amd64.deb
+          rm -f google-chrome-stable_current_amd64.deb
+          pip install -q openai-whisper
+
+      - name: Extract Project ZIP & Load Audio Files
+        run: |
+          python3 - << 'EOF'
+          import os, shutil, zipfile, glob
+
+          os.makedirs('project/public', exist_ok=True)
+
+          zips = sorted(glob.glob('*.zip'))
+          assert zips, 'No .zip file found in repository root!'
+          v2_zips = [z for z in zips if 'v2' in z.lower() or '54' in z.lower()]
+          chosen_zip = v2_zips[-1] if v2_zips else zips[-1]
+          with zipfile.ZipFile(chosen_zip, 'r') as z:
+              z.extractall('project')
+          print(f'Extracted: {chosen_zip}')
+
+          mp3s = sorted(glob.glob('*.mp3'))
+          assert mp3s, 'No .mp3 file found in repository root!'
+          for f in mp3s:
+              name_lower = os.path.basename(f).lower()
+              if any(k in name_lower for k in ['ambient', 'music', 'bg']):
+                  shutil.copy(f, 'project/public/ambient.mp3')
+                  print(f'Set background music: {f}')
+              else:
+                  shutil.copy(f, 'project/public/voiceover.mp3')
+                  print(f'Set voiceover: {f}')
+          EOF
+
+      - name: Install NPM Dependencies
+        working-directory: project
+        run: npm install
+
+      - name: Auto-Sync All 54 Scenes with Whisper
+        working-directory: project
+        run: python3 sync_audio.py
+
+      - name: Apply 24fps Zero-Blur Turbo Patch
+        working-directory: project
+        run: |
+          python3 - << 'EOF'
+          import json, re, textwrap
+
+          with open('src/syncedTimeline.json', 'r', encoding='utf-8') as f:
+              tl = json.load(f)
+          tl['fps'] = 24
+          with open('src/syncedTimeline.json', 'w', encoding='utf-8') as f:
+              json.dump(tl, f, indent=2, ensure_ascii=False)
+
+          fast_stage = '''import React, { useEffect, useRef } from 'react';
+          import { AbsoluteFill, useCurrentFrame, useVideoConfig } from 'remotion';
+          import { MoodType } from '../types';
+
+          const PARTICLES = Array.from({ length: 85 }, (_, i) => {
+            const rand = (s: number) => {
+              const x = Math.sin(s * 12.9898 + 78.233) * 43758.5453;
+              return x - Math.floor(x);
+            };
+            return {
+              x: rand(i * 3 + 1),
+              y: rand(i * 3 + 2),
+              r: 1.4 + rand(i * 3 + 3) * 2.6,
+              speedY: 0.008 + rand(i * 5 + 1) * 0.02,
+              speedX: (rand(i * 5 + 2) - 0.5) * 0.013,
+              phase: rand(i * 5 + 3) * Math.PI * 2,
+              alpha: 0.22 + rand(i * 7 + 1) * 0.5,
+              warmth: rand(i * 7 + 2),
+            };
+          });
+
+          export const AtmosphericStage: React.FC<{ mood: MoodType }> = ({ mood }) => {
+            const frame = useCurrentFrame();
+            const { width, height, fps } = useVideoConfig();
+            const canvasRef = useRef<HTMLCanvasElement>(null);
+            const t = frame / fps;
+
+            const isStorm = mood === 'storm';
+            const isFire = mood === 'fire';
+            const isSilence = mood === 'silence';
+            const isFinale = mood === 'finale';
+
+            useEffect(() => {
+              const canvas = canvasRef.current;
+              if (!canvas) return;
+              const ctx = canvas.getContext('2d');
+              if (!ctx) return;
+
+              ctx.clearRect(0, 0, width, height);
+
+              for (const p of PARTICLES) {
+                const speedMulX = isStorm ? 14 : isSilence ? 0.12 : 1.0;
+                const speedMulY = isFire ? 4.2 : isSilence ? 0.15 : 1.0;
+                const px = ((p.x + t * p.speedX * speedMulX + (isStorm ? t * 0.35 : 0) + Math.sin(t * 0.45 + p.phase) * 0.01) % 1 + 1) % 1;
+                const py = ((p.y - t * p.speedY * speedMulY) % 1 + 1) % 1;
+                const alpha = p.alpha * (0.65 + 0.35 * Math.sin(t * 1.7 + p.phase)) * (isFinale ? 1.25 : isSilence ? 0.45 : 1.0);
+                const xPos = px * width;
+                const yPos = py * height;
+
+                const rgb = isFire && p.warmth > 0.35 ? '255, 145, 58' : '242, 200, 120';
+                ctx.fillStyle = `rgba(${rgb}, ${Math.min(1, alpha * 0.28)})`;
+                ctx.beginPath();
+                ctx.arc(xPos, yPos, p.r * 2.6, 0, Math.PI * 2);
+                ctx.fill();
+
+                ctx.fillStyle = `rgba(${rgb}, ${Math.min(1, alpha)})`;
+                ctx.beginPath();
+                ctx.arc(xPos, yPos, p.r, 0, Math.PI * 2);
+                ctx.fill();
+              }
+            }, [frame, width, height, t, isStorm, isFire, isSilence, isFinale]);
+
+            const bgMap: Record<MoodType, string> = {
+              void: 'radial-gradient(ellipse at 50% 48%, #241a0f 0%, #0e0b08 56%, #060504 100%)',
+              garden: 'radial-gradient(ellipse at 50% 44%, #1f1b10 0%, #0d0c08 58%, #060504 100%)',
+              field: 'radial-gradient(ellipse at 50% 64%, #27160d 0%, #100b08 56%, #060504 100%)',
+              desert: 'radial-gradient(ellipse at 50% 45%, #2d1e10 0%, #130d08 58%, #070605 100%)',
+              cave: 'radial-gradient(ellipse at 50% 52%, #1e160f 0%, #0c0907 56%, #050404 100%)',
+              storm: 'radial-gradient(ellipse at 50% 48%, #1e1812 0%, #0c0a09 58%, #040404 100%)',
+              fire: 'radial-gradient(ellipse at 50% 60%, #3b1c0c 0%, #150b07 56%, #060404 100%)',
+              silence: 'radial-gradient(ellipse at 50% 50%, #16120c 0%, #090806 58%, #040404 100%)',
+              finale: 'radial-gradient(ellipse at 50% 42%, #402b12 0%, #161008 58%, #070605 100%)',
+            };
+
+            return (
+              <AbsoluteFill style={{ background: bgMap[mood] || bgMap.void, overflow: 'hidden' }}>
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: '-20%',
+                    left: '10%',
+                    width: '34%',
+                    height: '150%',
+                    background:
+                      'linear-gradient(90deg, transparent 0%, rgba(242,195,105,0.08) 50%, transparent 100%)',
+                    transform: `rotate(-21deg) translateX(${Math.sin(t * 0.22) * 16}px)`,
+                    pointerEvents: 'none',
+                  }}
+                />
+                <canvas ref={canvasRef} width={width} height={height} style={{ position: 'absolute', inset: 0 }} />
+                <AbsoluteFill
+                  style={{
+                    background: 'radial-gradient(circle at center, transparent 48%, rgba(0,0,0,0.68) 100%)',
+                    pointerEvents: 'none',
+                  }}
+                />
+              </AbsoluteFill>
+            );
+          };
+          '''
+          with open('src/components/AtmosphericStage.tsx', 'w', encoding='utf-8') as f:
+              f.write(textwrap.dedent(fast_stage))
+
+          with open('src/components/VisualScenes.tsx', 'r', encoding='utf-8') as f:
+              vs = f.read()
+          vs = re.sub(r"style=\{\{\s*filter:\s*'blur\([^)]+\)'\s*\}\}", "", vs)
+          with open('src/components/VisualScenes.tsx', 'w', encoding='utf-8') as f:
+              f.write(vs)
+
+          print('Turbo patch applied!')
+          EOF
+
+      - name: Render 1080p Video with Remotion
+        working-directory: project
+        run: |
+          mkdir -p out
+          CORES=$(nproc)
+          echo "Rendering with concurrency=${CORES}..."
+          npx remotion render MainVideo out/video_raw.mp4 --codec=h264 --crf=20 --x264-preset=veryfast --jpeg-quality=80 --concurrency=${CORES}
+
+      - name: Master Audio (-14 LUFS + Optional Ambient Ducking)
+        working-directory: project
+        run: |
+          OUT_FINAL="out/The_Question_God_Keeps_Asking_MASTER.mp4"
+          if [ -f "public/ambient.mp3" ]; then
+            echo "Mixing voiceover + ducked ambient music + -14 LUFS..."
+            ffmpeg -y -i out/video_raw.mp4 -stream_loop -1 -i public/ambient.mp3               -filter_complex "[1:a]volume=0.12[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=3,loudnorm=I=-14:TP=-1.5:LRA=11[aout]"               -map 0:v -map "[aout]" -c:v copy -c:a aac -b:a 192k "$OUT_FINAL"
+          else
+            echo "Mastering voiceover to YouTube -14 LUFS..."
+            ffmpeg -y -i out/video_raw.mp4               -af "loudnorm=I=-14:TP=-1.5:LRA=11"               -c:v copy -c:a aac -b:a 192k "$OUT_FINAL"
+          fi
+
+      - name: Upload Mastered MP4 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: The_Question_God_Keeps_Asking_MASTER
+          path: project/out/The_Question_God_Keeps_Asking_MASTER.mp4
+          retention-days: 7
